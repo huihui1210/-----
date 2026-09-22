@@ -156,7 +156,7 @@ export default function App() {
       const collected: CodeResult[] = [];
       for (let i = 0; i < data.rows.length; i += 1) {
         const row = data.rows[i];
-        // 多字段内容用换行拼接
+        // 多字段内容用换行拼接（二维码支持多行；条码会自动去除换行）
         const text = contentFields
           .map((field) => cellToText(row.fields[field.id], field.type).trim())
           .filter(Boolean)
@@ -169,6 +169,14 @@ export default function App() {
             text: '',
             fileName,
             error: '该记录的所选字段内容均为空，已跳过',
+          });
+        } else if (kind === 'barcode' && /[^\x00-\x7F]/.test(text)) {
+          // 一维码不支持非 ASCII 字符（如中文），提前提示
+          collected.push({
+            recordId: row.recordId,
+            text,
+            fileName,
+            error: '内容包含非 ASCII 字符（如中文），一维码不支持，请改用二维码或更换字段',
           });
         } else {
           try {

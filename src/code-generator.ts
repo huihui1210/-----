@@ -70,17 +70,25 @@ export function renderQRCode(text: string): Promise<string> {
  */
 export function renderBarcode(text: string, format: string, displayText: boolean): string {
   const canvas = document.createElement('canvas');
-  JsBarcode(canvas, text, {
-    format,
-    width: 2,
-    height: 120,
-    displayValue: displayText,
-    fontSize: 20,
-    margin: 14,
-    textMargin: 6,
-    background: '#ffffff',
-    lineColor: '#000000',
-  });
+  // 去除换行符，一维码不支持多行内容
+  const cleanText = text.replace(/[\r\n]+/g, ' ').trim();
+  try {
+    JsBarcode(canvas, cleanText, {
+      format,
+      width: 2,
+      height: 120,
+      displayValue: displayText,
+      fontSize: 20,
+      margin: 14,
+      textMargin: 6,
+      background: '#ffffff',
+      lineColor: '#000000',
+    });
+  } catch (error) {
+    // JsBarcode 抛出的错误信息可能不够友好，补充格式校验提示
+    const raw = error instanceof Error ? error.message : String(error);
+    throw new Error(`${format} 编码失败：${raw}。请检查内容是否符合该格式的字符要求。`);
+  }
   return canvas.toDataURL('image/png');
 }
 
