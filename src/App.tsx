@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { bitable } from '@lark-base-open/js-sdk';
-import { getSelectionInfo, getSelectedData, cellToText } from './bitable-helper';
-import type { SelectionInfo } from './bitable-helper';
+import { bitable, FieldType } from '@lark-base-open/js-sdk';
+import { getSelectionInfo, getSelectedData, cellToText, writeImageToCell } from './bitable-helper';
+import type { SelectionInfo, ColumnInfo } from './bitable-helper';
 import {
   BARCODE_FORMATS,
   renderQRCode,
@@ -19,6 +19,12 @@ interface Notice {
   text: string;
 }
 
+interface WriteBackResult {
+  recordId: string;
+  ok: boolean;
+  error?: string;
+}
+
 export default function App() {
   const [selection, setSelection] = useState<SelectionInfo | null>(null);
   const [checking, setChecking] = useState(true);
@@ -28,13 +34,19 @@ export default function App() {
 
   const [kind, setKind] = useState<CodeKind>('qr');
   const [barcodeFormat, setBarcodeFormat] = useState<string>('CODE128');
-  const [fieldId, setFieldId] = useState<string>('');
+  const [selectedFieldIds, setSelectedFieldIds] = useState<Set<string>>(new Set());
   const [displayText, setDisplayText] = useState(true);
+
+  // 写回附件相关
+  const [writeBackFieldId, setWriteBackFieldId] = useState<string>('');
+  const [writeBackMode, setWriteBackMode] = useState<'replace' | 'append'>('replace');
+  const [writeBackResults, setWriteBackResults] = useState<WriteBackResult[] | null>(null);
 
   const [results, setResults] = useState<CodeResult[]>([]);
   const [generating, setGenerating] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [zipping, setZipping] = useState(false);
+  const [writingBack, setWritingBack] = useState(false);
 
   const refreshingRef = useRef(false);
   const pendingRefreshRef = useRef(false);
@@ -77,26 +89,64 @@ export default function App() {
     };
   }, [refresh]);
 
-  // 当前选中字段在可见列中失效时，回退到第一列
+  // 可见列变化时，清理已失效的选中字段
   useEffect(() => {
     const columns = selection?.columns ?? [];
-    if (columns.length > 0 && !columns.some((col) => col.id === fieldId)) {
-      setFieldId(columns[0].id);
+    if (columns.length === 0) return;
+    const validIds = new Set(columns.map((col) => col.id));
+    setSelectedFieldIds((prev) => {
+      const next = new Set([...prev].filter((id) => validIds.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [selection]);
+
+  const columns = selection?.columns ?? [];
+  // 附件类型字段（用于写回图片）
+  const attachmentColumns = columns.filter((col) => col.type === FieldType.Attachment);
+
+  // 写回字段失效时重置
+  useEffect(() => {
+    if (attachmentColumns.length > 0 && !attachmentColumns.some((col) => col.id === writeBackFieldId)) {
+      setWriteBackFieldId('');
     }
-  }, [selection, fieldId]);
+  }, [attachmentColumns, writeBackFieldId]);
+
+  const toggleField = (id: string) => {
+    setSelectedFieldIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    setSelectedFieldIds((prev) => {
+      // 已全选则清空，否则全选
+      if (prev.size === columns.length) return new Set();
+      return new Set(columns.map((col) => col.id));
+    });
+  };
 
   const handleGenerate = async () => {
     setNotice(null);
+    setWriteBackResults(null);
     try {
       const data = await getSelectedData();
       if (data.rows.length === 0) {
         setNotice({ type: 'warning', text: '请先在「表格」视图中勾选至少一条记录。' });
         return;
       }
-      const column = data.columns.find((col) => col.id === fieldId) ?? data.columns[0];
-      if (!column) {
-        setNotice({ type: 'error', text: '当前视图没有可用的内容字段。' });
-        return;
+
+      // 确定参与拼接的内容字段
+      const contentFields: ColumnInfo[] = data.columns.filter((col) => selectedFieldIds.has(col.id));
+      if (contentFields.length === 0) {
+        const first = data.columns[0];
+        if (!first) {
+          setNotice({ type: 'error', text: '当前视图没有可用的内容字段。' });
+          return;
+        }
+        contentFields.push(first);
       }
 
       setGenerating(true);
@@ -106,15 +156,19 @@ export default function App() {
       const collected: CodeResult[] = [];
       for (let i = 0; i < data.rows.length; i += 1) {
         const row = data.rows[i];
-        const text = cellToText(row.fields[column.id], column.type).trim();
-        const fileName = buildFileName(kind, i, text);
+        // 多字段内容用换行拼接
+        const text = contentFields
+          .map((field) => cellToText(row.fields[field.id], field.type).trim())
+          .filter(Boolean)
+          .join('\n');
+        const fileName = buildFileName(kind, i, text.replace(/\n/g, ' '));
 
         if (!text) {
           collected.push({
             recordId: row.recordId,
             text: '',
             fileName,
-            error: '该记录的此字段内容为空，已跳过',
+            error: '该记录的所选字段内容均为空，已跳过',
           });
         } else {
           try {
@@ -139,13 +193,19 @@ export default function App() {
 
       const successCount = collected.filter((item) => item.dataUrl).length;
       const failCount = collected.length - successCount;
-      setNotice({
-        type: failCount > 0 ? 'warning' : 'success',
-        text:
-          failCount > 0
-            ? `生成完成：成功 ${successCount} 条，${failCount} 条失败或为空，请查看下方列表。`
-            : `已成功生成 ${successCount} 张图片，可单张下载或打包下载。`,
-      });
+
+      // 如果选了写回字段，自动执行写回
+      if (writeBackFieldId && successCount > 0) {
+        await doWriteBack(collected);
+      } else {
+        setNotice({
+          type: failCount > 0 ? 'warning' : 'success',
+          text:
+            failCount > 0
+              ? `生成完成：成功 ${successCount} 条，${failCount} 条失败或为空，请查看下方列表。`
+              : `已成功生成 ${successCount} 张图片，可单张下载或打包下载。`,
+        });
+      }
     } catch (error) {
       setNotice({
         type: 'error',
@@ -155,6 +215,52 @@ export default function App() {
       setGenerating(false);
       setProgress(null);
     }
+  };
+
+  const doWriteBack = async (items: CodeResult[]) => {
+    const selectionData = await getSelectionInfo().catch(() => null);
+    const tableId = (await bitable.base.getSelection()).tableId;
+    if (!tableId) return;
+
+    const writable = items.filter((item) => item.dataUrl);
+    if (writable.length === 0) return;
+
+    setWritingBack(true);
+    const wbResults: WriteBackResult[] = [];
+    let okCount = 0;
+    for (let i = 0; i < writable.length; i += 1) {
+      const item = writable[i];
+      try {
+        await writeImageToCell({
+          tableId,
+          fieldId: writeBackFieldId,
+          recordId: item.recordId,
+          dataUrl: item.dataUrl!,
+          fileName: item.fileName,
+          mode: writeBackMode,
+        });
+        wbResults.push({ recordId: item.recordId, ok: true });
+        okCount += 1;
+      } catch (error) {
+        wbResults.push({
+          recordId: item.recordId,
+          ok: false,
+          error: error instanceof Error ? error.message : '写入失败',
+        });
+      }
+    }
+    setWriteBackResults(wbResults);
+    setWritingBack(false);
+
+    const failCount = writable.length - okCount;
+    setNotice({
+      type: failCount > 0 ? 'warning' : 'success',
+      text:
+        failCount > 0
+          ? `生成并写入完成：成功 ${okCount} 条，${failCount} 条写入失败。`
+          : `已成功生成并写入 ${okCount} 张图片到附件字段。`,
+    });
+    void selectionData;
   };
 
   const handleDownloadZip = async () => {
@@ -169,10 +275,18 @@ export default function App() {
     }
   };
 
-  const columns = selection?.columns ?? [];
   const successCount = results.filter((item) => item.dataUrl).length;
   const currentHint = BARCODE_FORMATS.find((item) => item.value === barcodeFormat)?.hint;
   const recordCount = checking ? 0 : selection?.count ?? 0;
+  const allSelected = selectedFieldIds.size > 0 && selectedFieldIds.size === columns.length;
+
+  // 写回结果的映射，用于在结果列表中显示状态
+  const writeBackMap = new Map<string, WriteBackResult>();
+  if (writeBackResults) {
+    for (const item of writeBackResults) {
+      writeBackMap.set(item.recordId, item);
+    }
+  }
 
   return (
     <div className="app">
@@ -215,10 +329,8 @@ export default function App() {
 
       <section className="card">
         <div className="form-item">
-          <label className="form-label" htmlFor="code-kind">
-            图片类型
-          </label>
-          <div className="segmented" id="code-kind">
+          <label className="form-label">图片类型</label>
+          <div className="segmented">
             <button
               type="button"
               className={kind === 'qr' ? 'segmented-btn active' : 'segmented-btn'}
@@ -237,23 +349,33 @@ export default function App() {
         </div>
 
         <div className="form-item">
-          <label className="form-label" htmlFor="content-field">
-            内容字段
-          </label>
-          <select
-            id="content-field"
-            className="select"
-            value={fieldId}
-            disabled={columns.length === 0}
-            onChange={(event) => setFieldId(event.target.value)}
-          >
-            {columns.length === 0 && <option value="">暂无可选字段</option>}
-            {columns.map((col) => (
-              <option key={col.id} value={col.id}>
-                {col.name}
-              </option>
-            ))}
-          </select>
+          <div className="field-head">
+            <label className="form-label">内容字段（可多选）</label>
+            {columns.length > 0 && (
+              <button type="button" className="text-btn" onClick={toggleSelectAll}>
+                {allSelected ? '取消全选' : '全选'}
+              </button>
+            )}
+          </div>
+          {columns.length === 0 ? (
+            <p className="hint-line">当前视图没有可见字段</p>
+          ) : (
+            <div className="field-list">
+              {columns.map((col) => (
+                <label key={col.id} className="field-check">
+                  <input
+                    type="checkbox"
+                    checked={selectedFieldIds.has(col.id)}
+                    onChange={() => toggleField(col.id)}
+                  />
+                  <span className="field-check-name">{col.name}</span>
+                </label>
+              ))}
+            </div>
+          )}
+          {selectedFieldIds.size > 1 && (
+            <p className="hint-line">已选 {selectedFieldIds.size} 个字段，内容将按换行拼接</p>
+          )}
         </div>
 
         {kind === 'barcode' && (
@@ -288,6 +410,52 @@ export default function App() {
         )}
       </section>
 
+      <section className="card">
+        <div className="form-item">
+          <label className="form-label" htmlFor="writeback-field">
+            写入附件字段（可选）
+          </label>
+          {attachmentColumns.length === 0 ? (
+            <p className="hint-line">当前视图没有附件类型字段，如需写回请在表中添加「附件」字段</p>
+          ) : (
+            <select
+              id="writeback-field"
+              className="select"
+              value={writeBackFieldId}
+              onChange={(event) => setWriteBackFieldId(event.target.value)}
+            >
+              <option value="">不写入，仅下载</option>
+              {attachmentColumns.map((col) => (
+                <option key={col.id} value={col.id}>
+                  {col.name}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+        {writeBackFieldId && (
+          <div className="form-item">
+            <label className="form-label">写入方式</label>
+            <div className="segmented">
+              <button
+                type="button"
+                className={writeBackMode === 'replace' ? 'segmented-btn active' : 'segmented-btn'}
+                onClick={() => setWriteBackMode('replace')}
+              >
+                覆盖原有
+              </button>
+              <button
+                type="button"
+                className={writeBackMode === 'append' ? 'segmented-btn active' : 'segmented-btn'}
+                onClick={() => setWriteBackMode('append')}
+              >
+                追加
+              </button>
+            </div>
+          </div>
+        )}
+      </section>
+
       <button
         type="button"
         className="primary-btn"
@@ -296,8 +464,14 @@ export default function App() {
       >
         {generating && progress
           ? `生成中 ${progress.done} / ${progress.total}`
-          : `生成${kind === 'qr' ? '二维码' : '条形码'}（${recordCount} 条）`}
+          : writeBackFieldId
+            ? `生成并写入${kind === 'qr' ? '二维码' : '条形码'}（${recordCount} 条）`
+            : `生成${kind === 'qr' ? '二维码' : '条形码'}（${recordCount} 条）`}
       </button>
+
+      {writingBack && (
+        <div className="banner banner-info">正在将图片写入附件字段…</div>
+      )}
 
       {notice && <div className={`banner banner-${notice.type}`}>{notice.text}</div>}
 
@@ -306,6 +480,7 @@ export default function App() {
           <div className="results-head">
             <span className="card-label">
               生成结果：成功 {successCount} / 共 {results.length}
+              {writeBackResults && ` ｜ 写入完成 ${writeBackResults.filter((w) => w.ok).length} 条`}
             </span>
             <button
               type="button"
@@ -317,43 +492,56 @@ export default function App() {
             </button>
           </div>
           <div className="result-list">
-            {results.map((item, index) => (
-              <div className="result-item" key={item.recordId}>
-                {item.dataUrl ? (
-                  <>
-                    <div className="code-img">
-                      <img src={item.dataUrl} alt={item.text} />
+            {results.map((item, index) => {
+              const wb = writeBackMap.get(item.recordId);
+              return (
+                <div className="result-item" key={item.recordId}>
+                  {item.dataUrl ? (
+                    <>
+                      <div className="code-img">
+                        <img src={item.dataUrl} alt={item.text} />
+                      </div>
+                      <div className="result-meta">
+                        <span className="result-text" title={item.text}>
+                          {item.text.replace(/\n/g, ' · ') || '(空)'}
+                        </span>
+                        <div className="result-actions">
+                          {wb && (
+                            <span className={wb.ok ? 'wb-tag wb-ok' : 'wb-tag wb-fail'}>
+                              {wb.ok ? '已写入' : '写入失败'}
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            className="mini-btn"
+                            onClick={() => {
+                              if (item.dataUrl) downloadDataUrl(item.dataUrl, item.fileName);
+                            }}
+                          >
+                            下载
+                          </button>
+                        </div>
+                      </div>
+                      {wb && !wb.ok && wb.error && (
+                        <p className="wb-error-line">{wb.error}</p>
+                      )}
+                    </>
+                  ) : (
+                    <div className="result-error">
+                      <span className="result-index">第 {index + 1} 条</span>
+                      {item.error}
                     </div>
-                    <div className="result-meta">
-                      <span className="result-text" title={item.text}>
-                        {item.text || '(空)'}
-                      </span>
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        onClick={() => {
-                          if (item.dataUrl) downloadDataUrl(item.dataUrl, item.fileName);
-                        }}
-                      >
-                        下载
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <div className="result-error">
-                    <span className="result-index">第 {index + 1} 条</span>
-                    {item.error}
-                  </div>
-                )}
-              </div>
-            ))}
+                  )}
+                </div>
+              );
+            })}
           </div>
         </section>
       )}
 
       <p className="tips">
         使用方法：在「表格」视图中勾选记录 → 选择内容字段与类型 → 点击生成。
-        所有数据仅在当前页面处理，不会上传到外部服务器。
+        可选「写入附件字段」将图片自动写入记录的附件列。所有数据仅在当前页面处理。
       </p>
     </div>
   );

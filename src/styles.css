@@ -230,6 +230,52 @@ body {
   cursor: pointer;
 }
 
+/* Field multi-select list */
+.field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.field-list {
+  max-height: 168px;
+  overflow-y: auto;
+  border: 1px solid #dee0e3;
+  border-radius: 4px;
+  padding: 4px;
+  background: #fff;
+}
+
+.field-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #1f2329;
+  transition: background 0.1s;
+}
+
+.field-check:hover {
+  background: #f5f6f7;
+}
+
+.field-check input {
+  width: 15px;
+  height: 15px;
+  accent-color: #3370ff;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.field-check-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Primary button */
 .primary-btn {
   width: 100%;
@@ -366,6 +412,37 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.result-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.wb-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.wb-ok {
+  background: #e8ffea;
+  color: #2ea121;
+}
+
+.wb-fail {
+  background: #ffece8;
+  color: #f54a45;
+}
+
+.wb-error-line {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: #f54a45;
+  line-height: 1.4;
 }
 
 .mini-btn {

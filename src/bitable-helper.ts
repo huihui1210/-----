@@ -1,5 +1,5 @@
 import { bitable, FieldType } from '@lark-base-open/js-sdk';
-import type { IGridView, IRecord } from '@lark-base-open/js-sdk';
+import type { IGridView, IRecord, IOpenAttachment } from '@lark-base-open/js-sdk';
 
 /** 批量读取记录的批次大小（接口单次上限约 1000） */
 const CHUNK_SIZE = 500;
@@ -210,4 +210,56 @@ function formatDate(ms: number): string {
     return `${datePart} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
   }
   return datePart;
+}
+
+/* ── 附件写入 ── */
+
+/** data URL → File 对象 */
+export function dataUrlToFile(dataUrl: string, fileName: string): File {
+  const [meta, base64] = dataUrl.split(',');
+  const mime = meta?.match(/data:(.*?);base64/)?.[1] ?? 'image/png';
+  const binary = atob(base64 ?? '');
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new File([bytes], fileName, { type: mime });
+}
+
+/**
+ * 将 dataUrl 图片上传并写入指定记录的附件字段。
+ * mode: 'replace' 覆盖原有附件（默认）；'append' 追加到已有附件
+ */
+export async function writeImageToCell(params: {
+  tableId: string;
+  fieldId: string;
+  recordId: string;
+  dataUrl: string;
+  fileName: string;
+  mode?: 'replace' | 'append';
+}): Promise<void> {
+  const { tableId, fieldId, recordId, dataUrl, fileName, mode = 'replace' } = params;
+  const table = await bitable.base.getTableById(tableId);
+
+  const file = dataUrlToFile(dataUrl, fileName);
+  const [token] = await bitable.base.batchUploadFile([file]);
+  if (!token) throw new Error('文件上传失败');
+
+  const attachment: IOpenAttachment = {
+    name: fileName,
+    size: file.size,
+    type: file.type,
+    token,
+    timeStamp: Date.now(),
+  };
+
+  let cellValue: IOpenAttachment[] = [attachment];
+  if (mode === 'append') {
+    const existing = await table.getCellValue(fieldId, recordId);
+    if (Array.isArray(existing) && existing.length > 0) {
+      cellValue = [...(existing as IOpenAttachment[]), attachment];
+    }
+  }
+
+  await table.setCellValue(fieldId, recordId, cellValue);
 }
